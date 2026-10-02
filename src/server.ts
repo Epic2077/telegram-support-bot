@@ -8,8 +8,10 @@ import {
   getOrCreateActiveSession,
   addMessageToSession,
   getSessionMessages,
+  getRecentSessionMessages,
   closeSessionAndSaveLead,
 } from './services/supabase';
+import { getOpenAIClient, getTenantEmbeddingClient } from './services/embeddings';
 
 const app = express();
 app.use(express.json());
@@ -19,6 +21,57 @@ const WEBHOOK_DOMAIN = process.env.WEBHOOK_DOMAIN!;
 
 const INACTIVITY_LIMIT_MS = 3 * 60 * 1000; // 3 minutes
 const sessionTimers = new Map<string, NodeJS.Timeout>();
+
+// --- Rate Limiter (per-tenant sliding window) ---
+const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '30', 10);
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+
+function isRateLimited(tenantId: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(tenantId);
+
+  if (!entry || now >= entry.resetAt) {
+    rateLimitMap.set(tenantId, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return false;
+  }
+
+  if (entry.count >= RATE_LIMIT_MAX_REQUESTS) {
+    return true;
+  }
+
+  entry.count++;
+  return false;
+}
+
+// --- Error Alerting ---
+async function alertTenantError(tenant: any, errorMessage: string) {
+  if (!tenant.child_bot_token) return;
+  try {
+    // Notify the tenant that there's an issue with their AI configuration
+    await axios.post(`https://api.telegram.org/bot${tenant.child_bot_token}/sendMessage`, {
+      chat_id: tenant.telegram_user_id,
+      text: `⚠️ خطا در سرویس هوش مصنوعی:\n\n${errorMessage}\n\nلطفاً تنظیمات API Key خود را بررسی کنید.`,
+    }).catch(() => {}); // Silently fail if notification itself fails
+  } catch {
+    // Non-critical: don't crash on alert failures
+  }
+}
+
+async function alertOwnerError(errorMessage: string) {
+  const ownerChatId = process.env.OWNER_TELEGRAM_CHAT_ID;
+  const motherBotToken = process.env.MOTHER_BOT_TOKEN;
+  if (!ownerChatId || !motherBotToken) return;
+  try {
+    await axios.post(`https://api.telegram.org/bot${motherBotToken}/sendMessage`, {
+      chat_id: ownerChatId,
+      text: `🚨 <b>خطای سیستم</b>\n\n${errorMessage}`,
+      parse_mode: 'HTML',
+    }).catch(() => {});
+  } catch {
+    // Non-critical
+  }
+}
 
 // --- Helper: Extract Lead & Send to Channel ---
 async function extractLeadAndSendToChannel(tenant: any, userMeta: any, sessionId: string) {
@@ -34,7 +87,8 @@ async function extractLeadAndSendToChannel(tenant: any, userMeta: any, sessionId
   if (tenant.ai_provider === 'gapgpt') baseURL = 'https://api.gapgpt.app/v1';
   if (tenant.ai_provider === 'liara') baseURL = process.env.AI_LIARA_BASE_URL || 'https://ai.liara.ir/api/6abe8dfc7ce6d9a9e0475844/v1';
 
-  const aiClient = new OpenAI({ apiKey: tenant.ai_api_key, baseURL });
+  // Use cached client instead of creating new one each time
+  const aiClient = getOpenAIClient(tenant.ai_api_key, baseURL);
 
   let model = 'gpt-4o-mini';
   if (tenant.ai_provider === 'deepseek') model = 'deepseek-chat';
@@ -82,8 +136,13 @@ async function extractLeadAndSendToChannel(tenant: any, userMeta: any, sessionId
     // Save lead summary to database
     await closeSessionAndSaveLead(sessionId, leadData);
 
-  } catch (error) {
+  } catch (error: any) {
     console.error(`Failed to extract lead for tenant ${tenant.id}:`, error);
+    // Alert on API key errors (401, 403, or specific error codes)
+    if (error?.status === 401 || error?.status === 403 || error?.message?.includes('API key')) {
+      await alertTenantError(tenant, `کلید API هوش مصنوعی نامعتبر یا منقضی شده است. (${tenant.ai_provider})`);
+      await alertOwnerError(`Tenant ${tenant.telegram_username || tenant.id} (${tenant.ai_provider}): AI API key failed during lead extraction.`);
+    }
   }
 }
 
@@ -120,6 +179,22 @@ app.post('/webhook/child/:tenantId', async (req, res) => {
   const userQuery = update.message.text;
   const telegramMessageId = update.message.message_id;
   const userMeta = update.message.from;
+
+  // --- Rate Limit Check ---
+  if (isRateLimited(tenantId)) {
+    const { data: rlTenant } = await supabase
+      .from('tenants')
+      .select('child_bot_token')
+      .eq('id', tenantId)
+      .maybeSingle();
+    if (rlTenant?.child_bot_token) {
+      await axios.post(
+        `https://api.telegram.org/bot${rlTenant.child_bot_token}/sendMessage`,
+        { chat_id: chatId, text: '⏳ لطفاً چند لحظه صبر کنید. تعداد درخواست‌ها بیش از حد مجاز است.' },
+      ).catch(() => {});
+    }
+    return;
+  }
 
   try {
     // Fetch Tenant configuration & API keys from Supabase
@@ -165,19 +240,28 @@ app.post('/webhook/child/:tenantId', async (req, res) => {
     if (tenant.ai_provider === 'gapgpt') baseURL = 'https://api.gapgpt.app/v1';
     if (tenant.ai_provider === 'liara') baseURL = process.env.AI_LIARA_BASE_URL || 'https://ai.liara.ir/api/6abe8dfc7ce6d9a9e0475844/v1';
 
-    const aiClient = new OpenAI({
-      apiKey: tenant.ai_api_key,
-      baseURL: baseURL,
-    });
+    // Use cached clients (avoids creating new OpenAI instances per request)
+    const aiClient = getOpenAIClient(tenant.ai_api_key, baseURL);
+    const embeddingClient = getTenantEmbeddingClient(tenant);
 
-    const embeddingClient = new OpenAI({
-      apiKey: process.env.SYSTEM_OPENAI_KEY!,
-    });
-
-    const queryEmbed = await embeddingClient.embeddings.create({
-      model: 'text-embedding-3-small',
-      input: userQuery,
-    });
+    let queryEmbed;
+    try {
+      queryEmbed = await embeddingClient.embeddings.create({
+        model: 'text-embedding-3-small',
+        input: userQuery,
+      });
+    } catch (embedError: any) {
+      console.error(`Embedding API failed for tenant ${tenantId}:`, embedError);
+      if (embedError?.status === 401 || embedError?.status === 403 || embedError?.message?.includes('API key')) {
+        await alertTenantError(tenant, `کلید API embedding نامعتبر یا منقضی شده است.`);
+        await alertOwnerError(`Tenant ${tenant.telegram_username || tenant.id}: Embedding API key failed (provider: ${tenant.embedding_provider || 'system'}).`);
+      }
+      await axios.post(
+        `https://api.telegram.org/bot${tenant.child_bot_token}/sendMessage`,
+        { chat_id: chatId, text: '⚠️ متأسفانه در حال حاضر قادر به پاسخگویی نیستیم. لطفاً بعداً تلاش کنید.' },
+      ).catch(() => {});
+      return;
+    }
 
     const { data: matches } = await supabase.rpc('match_child_bot_knowledge', {
       query_embedding: queryEmbed.data[0].embedding,
@@ -188,20 +272,53 @@ app.post('/webhook/child/:tenantId', async (req, res) => {
 
     const contextText = matches?.map((m: any) => m.content).join('\n---\n') || 'اطلاعاتی یافت نشد.';
 
+    // --- Inject Conversation History (last 6 messages) ---
+    const historyMessages = await getRecentSessionMessages(sessionId, 6);
+
     let model = 'gpt-4o-mini';
     if (tenant.ai_provider === 'deepseek') model = 'deepseek-chat';
     if (tenant.ai_provider === 'liara') model = process.env.AI_LIARA_MODEL || 'gpt-4o-mini';
 
-    const completion = await aiClient.chat.completions.create({
-      model,
-      messages: [
-        {
-          role: 'system',
-          content: `شما یک دستیار پشتیبانی مشتریان هستید. فقط بر اساس اطلاعات زیر به زبان فارسی پاسخ دهید:\n\n${contextText}`,
-        },
-        { role: 'user', content: userQuery },
-      ],
-    });
+    // Build messages array with conversation history for better context
+    const chatMessages: OpenAI.ChatCompletionMessageParam[] = [
+      {
+        role: 'system',
+        content: `شما یک دستیار پشتیبانی مشتریان هستید. فقط بر اساس اطلاعات زیر به زبان فارسی پاسخ دهید:\n\n${contextText}` +
+          (historyMessages.length > 1 ? '\n\nبا توجه به مکالمه قبلی کاربر پاسخ مناسب بدهید.' : ''),
+      },
+    ];
+
+    // Add recent history as actual message turns (excluding the latest user message already saved)
+    if (historyMessages.length > 1) {
+      for (const msg of historyMessages.slice(0, -1)) {
+        chatMessages.push({
+          role: msg.role as 'user' | 'assistant',
+          content: msg.content,
+        });
+      }
+    }
+
+    // Current user query
+    chatMessages.push({ role: 'user', content: userQuery });
+
+    let completion;
+    try {
+      completion = await aiClient.chat.completions.create({
+        model,
+        messages: chatMessages,
+      });
+    } catch (aiError: any) {
+      console.error(`AI completion failed for tenant ${tenantId}:`, aiError);
+      if (aiError?.status === 401 || aiError?.status === 403 || aiError?.message?.includes('API key')) {
+        await alertTenantError(tenant, `کلید API ${tenant.ai_provider} نامعتبر یا منقضی شده است.`);
+        await alertOwnerError(`Tenant ${tenant.telegram_username || tenant.id} (${tenant.ai_provider}): AI completion API key failed.`);
+      }
+      await axios.post(
+        `https://api.telegram.org/bot${tenant.child_bot_token}/sendMessage`,
+        { chat_id: chatId, text: '⚠️ متأسفانه در حال حاضر قادر به پاسخگویی نیستیم. لطفاً بعداً تلاش کنید.' },
+      ).catch(() => {});
+      return;
+    }
 
     const responseText = completion.choices[0].message.content || 'پاسخی یافت نشد.';
 

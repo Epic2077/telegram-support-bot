@@ -1,4 +1,6 @@
-import axios from 'axios';
+import axios, { AxiosInstance } from 'axios';
+import http from 'http';
+import https from 'https';
 import { XMLParser } from 'fast-xml-parser';
 import * as cheerio from 'cheerio';
 
@@ -7,17 +9,51 @@ export interface ScrapedPage {
   content: string;
 }
 
+// Shared HTTP agent with connection pooling (keep-alive)
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 10 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 10 });
+
+const scraperClient: AxiosInstance = axios.create({
+  timeout: 15000,
+  headers: {
+    'User-Agent': 'Mozilla/5.0 (compatible; SupportBot/1.0)',
+  },
+  httpAgent,
+  httpsAgent,
+});
+
+/**
+ * Run tasks with bounded concurrency.
+ * @param items - Items to process
+ * @param fn - Async function to process each item
+ * @param concurrency - Max parallel tasks (default 5)
+ */
+async function parallelMap<T, R>(
+  items: T[],
+  fn: (item: T) => Promise<R>,
+  concurrency: number,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const idx = nextIndex++;
+      results[idx] = await fn(items[idx]);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
+}
+
 export async function fetchSitemapUrls(domain: string): Promise<string[]> {
   const baseUrl = domain.replace(/\/$/, '');
   const sitemapUrl = baseUrl + '/sitemap.xml';
   
   try {
-    const response = await axios.get(sitemapUrl, {
-      timeout: 15000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; SupportBot/1.0)',
-      },
-    });
+    const response = await scraperClient.get(sitemapUrl);
 
     const parser = new XMLParser({
       ignoreAttributes: false,
@@ -33,12 +69,14 @@ export async function fetchSitemapUrls(domain: string): Promise<string[]> {
         ? result.sitemapindex.sitemap 
         : [result.sitemapindex.sitemap];
       
-      for (const entry of sitemapEntries) {
-        if (entry.loc) {
-          // Fetch each individual sitemap
-          const subUrls = await fetchUrlsFromSitemap(entry.loc);
-          urls.push(...subUrls);
-        }
+      // Fetch sub-sitemaps in parallel (up to 5 concurrently)
+      const subUrlArrays = await parallelMap(
+        sitemapEntries.filter((e: any) => e.loc),
+        (entry: any) => fetchUrlsFromSitemap(entry.loc),
+        5,
+      );
+      for (const subUrls of subUrlArrays) {
+        urls.push(...subUrls);
       }
     }
     // Regular sitemap with urlset
@@ -60,12 +98,7 @@ export async function fetchSitemapUrls(domain: string): Promise<string[]> {
 
 async function fetchUrlsFromSitemap(sitemapUrl: string): Promise<string[]> {
   try {
-    const response = await axios.get(sitemapUrl, {
-      timeout: 15000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; SupportBot/1.0)',
-      },
-    });
+    const response = await scraperClient.get(sitemapUrl);
 
     const parser = new XMLParser({
       ignoreAttributes: false,
@@ -93,12 +126,7 @@ async function fetchUrlsFromSitemap(sitemapUrl: string): Promise<string[]> {
 
 export async function scrapePage(url: string): Promise<ScrapedPage | null> {
   try {
-    const response = await axios.get(url, {
-      timeout: 15000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; SupportBot/1.0)',
-      },
-    });
+    const response = await scraperClient.get(url);
 
     const $ = cheerio.load(response.data);
     
@@ -144,6 +172,40 @@ export async function scrapePage(url: string): Promise<ScrapedPage | null> {
     console.error(`Error scraping ${url}:`, error);
     return null;
   }
+}
+
+/**
+ * Scrape multiple pages in parallel with bounded concurrency.
+ * @param urls - URLs to scrape
+ * @param concurrency - Max parallel requests (default 5)
+ * @param delayMs - Delay between launching each request (default 100ms, respectful crawling)
+ */
+export async function scrapePagesParallel(
+  urls: string[],
+  concurrency: number = 5,
+  delayMs: number = 100,
+): Promise<ScrapedPage[]> {
+  const scrapedPages: ScrapedPage[] = [];
+
+  // Launch tasks with staggered starts to avoid burst
+  async function scrapeWithDelay(url: string): Promise<void> {
+    const page = await scrapePage(url);
+    if (page) {
+      scrapedPages.push(page);
+    }
+  }
+
+  // Process in batches of `concurrency` with small delays between batches
+  for (let i = 0; i < urls.length; i += concurrency) {
+    const batch = urls.slice(i, i + concurrency);
+    await Promise.all(batch.map(url => scrapeWithDelay(url)));
+    // Small delay between batches to be respectful
+    if (i + concurrency < urls.length && delayMs > 0) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+
+  return scrapedPages;
 }
 
 export function chunkText(text: string, maxChunkSize: number = 1000): string[] {

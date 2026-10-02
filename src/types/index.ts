@@ -13,6 +13,8 @@ export interface Tenant {
   website_url: string | null;
   ai_provider: 'openai' | 'deepseek' | 'gapgpt' | 'liara' | null;
   ai_api_key: string | null;
+  embedding_provider: 'openai' | 'deepseek' | 'gapgpt' | 'liara' | null;
+  embedding_api_key: string | null;
   hosting_choice: 'MANAGED' | 'SELF_HOSTED_GUIDE' | 'CUSTOM_REQUEST' | null;
   lead_channel_id: string | number | null;
   created_at: string;

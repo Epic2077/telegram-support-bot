@@ -16,6 +16,8 @@ CREATE TABLE tenants (
   website_url TEXT,
   ai_provider TEXT CHECK (ai_provider IN ('openai', 'deepseek', 'gapgpt', 'liara')),
   ai_api_key TEXT,
+  embedding_provider TEXT CHECK (embedding_provider IN ('openai', 'deepseek', 'gapgpt', 'liara')),
+  embedding_api_key TEXT,
   hosting_choice TEXT CHECK (hosting_choice IN ('MANAGED', 'SELF_HOSTED_GUIDE', 'CUSTOM_REQUEST')),
   lead_channel_id TEXT,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -74,7 +76,8 @@ CREATE TABLE lead_summaries (
 );
 
 -- Indexes
-CREATE INDEX ON knowledge_base USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);
+-- HNSW index for vector similarity search (replaces IVFFlat - works with streaming inserts, no rebuild needed)
+CREATE INDEX idx_knowledge_base_embedding ON knowledge_base USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
 CREATE INDEX idx_knowledge_base_tenant_id ON knowledge_base(tenant_id);
 CREATE INDEX idx_tenants_telegram_user_id ON tenants(telegram_user_id);
 CREATE INDEX idx_tenants_status ON tenants(status);
@@ -82,9 +85,11 @@ CREATE INDEX idx_tenants_role ON tenants(role);
 CREATE INDEX idx_chat_sessions_tenant_id ON chat_sessions(tenant_id);
 CREATE INDEX idx_chat_sessions_user_telegram_id ON chat_sessions(user_telegram_id);
 CREATE INDEX idx_chat_sessions_status ON chat_sessions(status);
-CREATE INDEX idx_chat_messages_session_id ON chat_messages(session_id);
+-- Composite index for conversation history lookups (session + chronological order)
+CREATE INDEX idx_chat_messages_session_created ON chat_messages(session_id, created_at ASC);
 CREATE INDEX idx_chat_messages_created_at ON chat_messages(created_at);
 CREATE INDEX idx_lead_summaries_tenant_id ON lead_summaries(tenant_id);
+CREATE INDEX idx_lead_summaries_session_id ON lead_summaries(session_id);
 CREATE INDEX idx_lead_summaries_created_at ON lead_summaries(created_at);
 
 -- Isolated Similarity Search RPC Function

@@ -164,6 +164,61 @@ export async function insertKnowledgeChunks(tenantId: string, chunks: { page_url
   return true;
 }
 
+/**
+ * Insert knowledge chunks in batches of 500 rows.
+ * Prevents Supabase/PostgREST payload size limits and improves throughput.
+ */
+export async function insertKnowledgeChunksBatched(
+  tenantId: string,
+  chunks: { page_url: string; content: string; embedding: number[] }[],
+  batchSize: number = 500,
+): Promise<boolean> {
+  const records = chunks.map(chunk => ({
+    tenant_id: tenantId,
+    page_url: chunk.page_url,
+    content: chunk.content,
+    embedding: chunk.embedding,
+  }));
+
+  for (let i = 0; i < records.length; i += batchSize) {
+    const batch = records.slice(i, i + batchSize);
+    const { error } = await supabase
+      .from('knowledge_base')
+      .insert(batch);
+
+    if (error) {
+      console.error(`Error inserting knowledge chunks batch ${i}-${i + batch.length}:`, error);
+      return false;
+    }
+  }
+
+  return true;
+}
+
+/**
+ * Get the last N messages from a chat session for conversation history context.
+ * Returns messages in chronological order.
+ */
+export async function getRecentSessionMessages(
+  sessionId: string,
+  limit: number = 6,
+): Promise<{ role: string; content: string }[]> {
+  const { data, error } = await supabase
+    .from('chat_messages')
+    .select('role, content, created_at')
+    .eq('session_id', sessionId)
+    .order('created_at', { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    console.error('Error getting recent session messages:', error);
+    return [];
+  }
+
+  // Reverse to chronological order
+  return (data || []).reverse().map(m => ({ role: m.role, content: m.content }));
+}
+
 export async function searchKnowledgeBase(
   tenantId: string, 
   queryEmbedding: number[], 

@@ -1,11 +1,21 @@
-import { fetchSitemapUrls, scrapePage, chunkText, ScrapedPage } from './scraper';
-import { generateEmbeddings } from './embeddings';
-import { insertKnowledgeChunks, deleteKnowledgeBase } from './supabase';
+import { fetchSitemapUrls, scrapePagesParallel, chunkText, ScrapedPage } from './scraper';
+import { generateEmbeddings, getTenantEmbeddingClient } from './embeddings';
+import { insertKnowledgeChunksBatched, deleteKnowledgeBase } from './supabase';
 
-export async function ingestWebsite(tenantId: string, domain: string): Promise<{ success: boolean; pagesScraped: number; chunksCreated: number; error?: string }> {
+// Configurable limits
+const MAX_PAGES = parseInt(process.env.SCRAPER_MAX_PAGES || '500', 10);
+const SCRAPE_CONCURRENCY = parseInt(process.env.SCRAPER_CONCURRENCY || '5', 10);
+const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPER_DELAY_MS || '100', 10);
+
+export async function ingestWebsite(
+  tenantId: string,
+  domain: string,
+  tenant?: { ai_provider?: string | null; ai_api_key?: string | null; embedding_provider?: string | null; embedding_api_key?: string | null },
+): Promise<{ success: boolean; pagesScraped: number; chunksCreated: number; error?: string }> {
   try {
     console.log(`Starting ingestion for tenant ${tenantId}, domain: ${domain}`);
-    
+    const startTime = Date.now();
+
     // Clear existing knowledge base
     await deleteKnowledgeBase(tenantId);
     
@@ -17,20 +27,14 @@ export async function ingestWebsite(tenantId: string, domain: string): Promise<{
       return { success: false, pagesScraped: 0, chunksCreated: 0, error: 'No URLs found in sitemap' };
     }
     
-    // Scrape pages (limit to first 50 to avoid timeout)
-    const pagesToScrape = urls.slice(0, 50);
-    const scrapedPages: ScrapedPage[] = [];
+    // Limit pages to scrape (configurable, default 500)
+    const pagesToScrape = urls.slice(0, MAX_PAGES);
+    console.log(`Scraping ${pagesToScrape.length} pages (concurrency: ${SCRAPE_CONCURRENCY})`);
+
+    // Parallel scraping with connection pooling
+    const scrapedPages = await scrapePagesParallel(pagesToScrape, SCRAPE_CONCURRENCY, SCRAPE_DELAY_MS);
     
-    for (const url of pagesToScrape) {
-      const page = await scrapePage(url);
-      if (page) {
-        scrapedPages.push(page);
-      }
-      // Small delay to be respectful
-      await new Promise(resolve => setTimeout(resolve, 200));
-    }
-    
-    console.log(`Successfully scraped ${scrapedPages.length} pages`);
+    console.log(`Successfully scraped ${scrapedPages.length} pages in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
     
     if (scrapedPages.length === 0) {
       return { success: false, pagesScraped: 0, chunksCreated: 0, error: 'No content could be scraped' };
@@ -47,9 +51,10 @@ export async function ingestWebsite(tenantId: string, domain: string): Promise<{
     
     console.log(`Created ${allChunks.length} chunks`);
     
-    // Generate embeddings
+    // Generate embeddings using tenant-specific client if available
     const texts = allChunks.map(c => c.content);
-    const embeddings = await generateEmbeddings(texts);
+    const embeddingClient = tenant ? getTenantEmbeddingClient(tenant) : undefined;
+    const embeddings = await generateEmbeddings(texts, embeddingClient);
     
     console.log(`Generated ${embeddings.length} embeddings`);
     
@@ -60,13 +65,16 @@ export async function ingestWebsite(tenantId: string, domain: string): Promise<{
       embedding: embeddings[index],
     }));
     
-    // Insert into database
-    const inserted = await insertKnowledgeChunks(tenantId, records);
+    // Batched insert into database (500 rows per batch)
+    const inserted = await insertKnowledgeChunksBatched(tenantId, records);
     
     if (!inserted) {
       return { success: false, pagesScraped: scrapedPages.length, chunksCreated: 0, error: 'Failed to insert chunks into database' };
     }
     
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(`Ingestion complete: ${scrapedPages.length} pages, ${records.length} chunks in ${elapsed}s`);
+
     return { 
       success: true, 
       pagesScraped: scrapedPages.length, 

@@ -744,7 +744,7 @@ bot.action("hosting_custom", async (ctx) => {
   await ctx.answerCbQuery("درخواست ثبت شد");
 });
 
-bot.hears("/resync", async (ctx) => {
+bot.command("resync", async (ctx) => {
   const userId = ctx.from!.id;
   const tenant = await getTenantByTelegramId(userId);
 
@@ -760,7 +760,7 @@ bot.hears("/resync", async (ctx) => {
 
   await ctx.reply(PERSIAN_MESSAGES.resyncStarted);
 
-  const result = await ingestWebsite(tenant.id, tenant.website_url);
+  const result = await ingestWebsite(tenant.id, tenant.website_url, tenant);
 
   if (result.success) {
     await ctx.reply(
@@ -778,7 +778,7 @@ bot.hears("/resync", async (ctx) => {
   }
 });
 
-bot.hears("/status", async (ctx) => {
+bot.command("status", async (ctx) => {
   const userId = ctx.from!.id;
   const tenant = await getTenantByTelegramId(userId);
 
@@ -803,6 +803,29 @@ bot.hears("/status", async (ctx) => {
   if (tenant.lead_channel_id) msg += `<b>کانال لیدها:</b> متصل ✅\n`;
 
   await ctx.reply(msg, { parse_mode: "HTML" });
+});
+
+bot.command("cancel", async (ctx) => {
+  const userId = ctx.from!.id;
+  const isOwner = String(userId) === OWNER_CHAT_ID;
+  const prevState = getUserState(userId);
+
+  clearUserState(userId);
+
+  if (!prevState) {
+    // Nothing was in progress — just show the welcome screen
+    await ctx.reply(PERSIAN_MESSAGES.welcome, getMainKeyboard(isOwner));
+    return;
+  }
+
+  await ctx.reply(
+    `🔄 <b>فرآیند لغو شد و از ابتدا شروع می‌شود</b>\n\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `تمامی اطلاعات قبلی شما حفظ شده است.\n\n` +
+      `💡 می‌توانید مجدداً از <code>/start</code> استفاده کنید\n` +
+      `یا یکی از گزینه‌های زیر را انتخاب کنید:`,
+    { parse_mode: "HTML", ...getMainKeyboard(isOwner) },
+  );
 });
 
 bot.on("text", async (ctx) => {
@@ -976,7 +999,7 @@ bot.on("text", async (ctx) => {
     await updateTenantWebsite(tenant.id, url);
     await ctx.reply(PERSIAN_MESSAGES.websiteReceived.replace("{website}", url));
 
-    const result = await ingestWebsite(tenant.id, url);
+    const result = await ingestWebsite(tenant.id, url, tenant);
 
     if (result.success) {
       clearUserState(userId);
@@ -1916,7 +1939,7 @@ bot.hears(/.*/, async (ctx) => {
     await updateTenantWebsite(tenant.id, url);
     await ctx.reply(PERSIAN_MESSAGES.websiteReceived.replace("{website}", url));
 
-    const result = await ingestWebsite(tenant.id, url);
+    const result = await ingestWebsite(tenant.id, url, tenant);
 
     if (result.success) {
       clearUserState(userId);
@@ -2203,24 +2226,6 @@ bot.action("search_sessions", async (ctx) => {
   await ctx.answerCbQuery();
 });
 
-bot.command("cancel", async (ctx) => {
-  const userId = ctx.from!.id;
-
-  // Find and delete pending tenant for this user if exists
-  const tenant = await getTenantByTelegramId(userId);
-  if (tenant && tenant.status === "PENDING") {
-    await supabase.from("tenants").delete().eq("id", tenant.id);
-    await ctx.reply(
-      "❌ <b>درخواست معلق شما لغو و حذف شد.</b>\n\nمی‌توانید با /start مجدداً درخواست دهید.",
-      { parse_mode: "HTML" },
-    );
-  } else {
-    clearUserState(userId);
-    const isOwner = String(userId) === OWNER_CHAT_ID;
-    await ctx.reply(PERSIAN_MESSAGES.welcome, getMainKeyboard(isOwner));
-  }
-});
-
 bot.command("pending", async (ctx) => {
   if (String(ctx.from!.id) !== OWNER_CHAT_ID) return;
 
@@ -2244,6 +2249,14 @@ export async function startMotherBot() {
   // Set webhook for mother bot if needed
   const webhookUrl = `https://${WEBHOOK_DOMAIN}/webhook/mother`;
   await setWebhook(process.env.MOTHER_BOT_TOKEN!, webhookUrl);
+
+  // Register the slash-command menu so users see it in the "/" button
+  await bot.telegram.setMyCommands([
+    { command: "start", description: "🚀 شروع / بازگشت به منوی اصلی" },
+    { command: "status", description: "📊 مشاهده وضعیت ربات شما" },
+    { command: "resync", description: "🔄 همگام‌سازی مجدد با وب‌سایت" },
+    { command: "cancel", description: "❌ لغو فرآیند فعلی و شروع مجدد" },
+  ]);
 
   await bot.launch();
   console.log("Mother Bot is running!");
